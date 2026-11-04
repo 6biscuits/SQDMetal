@@ -1463,7 +1463,7 @@ class TransmonTapered2(TransmonTaperedInsets):
                 0,
                 p.taper_width_top,
                 p.taper_width_base,
-                p.taper_height,
+                p.taper_height*1.05,#fudge factor for the trapezoid
                 (pad_gap / 2) - float(p.taper_height),
                 p.taper_fillet_radius,
                 p.pad_width / 2 ,
@@ -1480,6 +1480,7 @@ class TransmonTapered2(TransmonTaperedInsets):
                 180,
                 origin=(0, pad_gap / 4 + (pad_gap / 2 - float(p.taper_height)) / 2),
             )  # Rotate trapezoid by 180 degrees
+            trapezoid_top_rotated=draw.translate(trapezoid_top_rotated, 0, p.taper_height*0.05)#fudge factor added to the trapezoid is inside the pad
             # create union
             pad_top_tmp = draw.union(
                 pad_top_tmp1.buffer(0), trapezoid_top_rotated.buffer(0)
@@ -1554,7 +1555,7 @@ class TransmonTapered2(TransmonTaperedInsets):
                 center_x=0,
                 top_width=p.taper_width_top,
                 base_width=p.taper_width_base,
-                height=p.taper_height,
+                height=p.taper_height*1.05,
                 y_offset=-(pad_gap / 2),
                 rfillet=p.taper_fillet_radius,
                 startx=p.pad_width / 2,
@@ -1564,7 +1565,7 @@ class TransmonTapered2(TransmonTaperedInsets):
                 cap=draw.Point(x_offset_b, p.taper_height-(pad_gap / 2)+(finger_height_b)).buffer(finger_width_b/2)
                 trapezoid_bot=draw.union([trapezoid_bot, finger, cap])
 
-            trapezoid_bot = draw.translate(trapezoid_bot, taper_x_offset, 0)  # Shift trapezoid left or right based on junction_centered option
+            trapezoid_bot = draw.translate(trapezoid_bot, taper_x_offset, -p.taper_height*0.05)  # Shift trapezoid left or right based on junction_centered option
             pad_bot = draw.union(pad_bot, trapezoid_bot)
 
         # outer corners
@@ -1667,6 +1668,16 @@ class TransmonTapered2(TransmonTaperedInsets):
                 # Extend outward
             ]
         )
+        if make_finger_t:
+            top_pin_finger = LineString(
+                [
+                    [taper_x_offset-x_offset_t-(finger_width_t/2), (pad_gap / 2)-finger_height_t-p.taper_height],
+                    [taper_x_offset-x_offset_t+(finger_width_t/2), (pad_gap / 2)-finger_height_t-p.taper_height],  # Start from pad bottom edge
+                    # Extend outward
+                ]
+            )#top_pin was also used to map out the transparent JJ box for simulations. to not mess things up set the coords for the actual pin to be another variable
+        else:
+            top_pin_finger=top_pin
         if make_finger_b:
             bottom_pin = LineString(
                 [
@@ -1778,6 +1789,7 @@ class TransmonTapered2(TransmonTaperedInsets):
             pad_bot,
             rect_pk,
             top_pin,
+            top_pin_finger,
             bottom_pin,
             top_right_pocket_pin,
             bottom_right_pocket_pin,
@@ -1794,6 +1806,7 @@ class TransmonTapered2(TransmonTaperedInsets):
             pad_bot,
             rect_pk,
             top_pin,
+            top_pin_finger,
             bottom_pin,
             top_right_pocket_pin,
             bottom_right_pocket_pin,
@@ -1810,12 +1823,17 @@ class TransmonTapered2(TransmonTaperedInsets):
         self.add_qgeometry("junction", dict(rect_jj=rect_jj), width=p.inductor_width)
 
         # Pins from the center of the qubit pads
-        self.add_pin(
-            "pin_island",
-            points=list(top_pin.coords),
-            width=taper_width_top,
-            input_as_norm=True,
-        )
+        if not make_finger_t:
+            self.add_pin(
+                "pin_island",
+                points=list(top_pin_finger.coords),
+                width=taper_width_top,
+                input_as_norm=True,
+            )
+        else:
+            top_pin_cords=list(draw.shapely.geometry.shape(top_pin_finger).coords)
+            self.add_pin("pin_island",
+                         top_pin_cords[::-1], taper_width_top)
         if not make_finger_b:
             self.add_pin(
                 "pin_reservoir",
@@ -3163,6 +3181,7 @@ class FluxoniumPocket(_FluxoniumPocket):
                            bot_wire_center_y='-0.0097mm',
                            bot_wire_height='0.015mm',
                            bot_wire_width='0.0039mm',
+                           shift_JJ=False,#This will move the x-position of transparent box of JJ to be where it would be if fingers are present
                            flux_bias_line_options=Dict(
                                _FluxoniumPocket.default_options.flux_bias_line_options,
                                mirror=False,#mirrors the flux bias line across x-axis
@@ -3373,7 +3392,11 @@ class FluxoniumPocket(_FluxoniumPocket):
 
         # Draw the junction
         jj_o = float(p.jj_orientation) # one can change the JJ orientation. Fab related detail.
-        rect_jj = draw.LineString([(0, -pad_gap/2*jj_o), (0, +pad_gap/2*jj_o)])
+        if p.shift_JJ:
+            center_x=(p.bot_wire_center_x+p.top_wire_center_x)/2#trying to find the center between
+        else:
+            center_x=0
+        rect_jj = draw.LineString([(center_x, -pad_gap/2*jj_o), (center_x, +pad_gap/2*jj_o)])
 
         if p.top_wire_connector & p.bot_wire_connector:
             center_x=(p.bot_wire_center_x+p.top_wire_center_x)/2#trying to find the center between
@@ -3508,8 +3531,8 @@ class FluxoniumPocket(_FluxoniumPocket):
         ])
         circle_bot = draw.subtract(circle_bot, cut_ply2)
         flux_bias_linebot = draw.Polygon([
-            (d+fbl_sep/2, -fbl_height/2),   # point i
-            (d+fbl_sep/2, -fbl_height/2-cpw_width),    # point k
+            (d+fbl_lead, -fbl_height/2),   # point i
+            (d+fbl_lead, -fbl_height/2-cpw_width),    # point k
             (fbl_sep, -fbl_height/2-cpw_width),   # point l
             (fbl_sep, -fbl_height/2),   # point m
         ])
@@ -3518,7 +3541,7 @@ class FluxoniumPocket(_FluxoniumPocket):
 
         # Flux Bias line's gap part, inside the GND
         flux_bias_line_gap = draw.rectangle(
-            fbl_lead, cpw_width+cpw_gap*2, d+fbl_sep/4, -fbl_height/2-cpw_width/2)
+            fbl_lead, cpw_width+cpw_gap*2, d+fbl_lead/2, -fbl_height/2-cpw_width/2)
 
         # Flux-Bias Line CPW wire
         port_line = draw.LineString([((d+fbl_lead), 0),
