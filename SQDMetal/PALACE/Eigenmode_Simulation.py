@@ -239,7 +239,7 @@ class PALACE_Eigenmode_Simulation(PALACE_Model_Base_RF):
                 json.dump(config_json, f, indent=2)
 
     @staticmethod
-    def retrieve_data_from_files(directory: str):
+    def retrieve_data_from_files(directory: str, shading="flat", remove_degenerate=True):
         '''
         Retrieves data from a given directory produced from the eigenmode simulation and creates plots of the electric fields.
 
@@ -264,7 +264,7 @@ class PALACE_Eigenmode_Simulation(PALACE_Model_Base_RF):
             for m in range(leView.num_datasets):
                 try: 
                     leSlice = leView.get_data_slice(m)
-                    fig = leSlice.plot(np.linalg.norm(leSlice.get_data('E_real'), axis=1), 'coolwarm', True)
+                    fig = leSlice.plot(np.linalg.norm(leSlice.get_data('E_real'), axis=1), 'coolwarm', True, shading=shading, remove_degenerate=remove_degenerate)
                     fig.savefig(directory + f'/eig{m}_ErealMag.png')
                     plt.close(fig)
                 except Exception as e:
@@ -731,8 +731,10 @@ class PALACE_Eigenmode_Simulation(PALACE_Model_Base_RF):
         else:
             n_modes = min(len(png_files), len(participations))
 
-        n_rows = 2 if n_modes > 1 else 1
-        n_cols = int(np.ceil(n_modes / n_rows))
+        n_cols = 4 if n_modes > 4 else n_modes
+        n_rows = int(np.ceil(n_modes / n_cols))
+        # n_rows = 2 if n_modes > 1 else 1
+        # n_cols = int(np.ceil(n_modes / n_rows))
 
         fig = plt.figure(figsize=(4.2 * n_cols, 4.4 * n_rows))
         path = os.path.normpath(directory)
@@ -760,11 +762,11 @@ class PALACE_Eigenmode_Simulation(PALACE_Model_Base_RF):
             if skip_postprocessing:
                 q_val = mode_dict['loaded_Q'][eig_num]
                 q_str = f"{q_val:.0f}" if isinstance(q_val, (int, float, np.floating)) else str(q_val)
-                lines = [f"f = {f_ghz:.3f} GHz    Q = {q_str}"]
+                lines = [f"$f$ = {f_ghz:.3f} GHz    $Q_L$ = {q_str}"]
             else:
                 p = participations[eig_num]
                 lines = [
-                    rf"f = {f_ghz:.3f} GHz   Q = {p['Q']:.0f}   $\kappa$ = {mode_dict['kappa'][eig_num] * 1e3:.3f} MHz",
+                    rf"$f$ = {f_ghz:.3f} GHz   $Q_L$ = {p['Q']:.0f}   $\kappa$ = {mode_dict['kappa'][eig_num] * 1e3:.3f} MHz",
                     rf"$p_{{MS}}$ = {p['MS']['p']:.2e}   $p_{{MA}}$ = {p['MA']['p']:.2e}   $p_{{SA}}$ = {p['SA']['p']:.2e}",
                 ]
             text = "\n".join(lines)
