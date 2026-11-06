@@ -363,6 +363,11 @@ class MakeGDS:
         """
         try:
             import pya # type: ignore
+
+            gds_input_file = str(gds_input_file)
+            if not gds_input_file.lower().endswith(".gds"):
+                gds_input_file = f"{gds_input_file}.gds"
+
             # Load the layout
             layout = pya.Layout()
             layout.read(f"{gds_input_file}.gds") if gds_input_file[-4:] != ".gds" else layout.read(f"{gds_input_file}")
