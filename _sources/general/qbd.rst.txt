@@ -63,9 +63,18 @@ This represents a simple parallel LC circuit. The class can be instantiated by p
     resonator2 = ResonatorLC(f0=7.25e9, C=1e-12)
     resonator3 = ResonatorLC(L=1e-9, C=1e-12)
 
+Because the circuit is a parallel LC, ``get_res_capacitance()`` returns the stored capacitance :math:`C` and ``get_res_inductance()`` returns the stored inductance :math:`L`; ``get_res_impedance()`` returns the characteristic impedance :math:`\sqrt{L/C}`. If all three parameters are supplied they must satisfy :math:`2\pi f_0 = 1/\sqrt{LC}` (relative tolerance :math:`10^{-12}`), otherwise an assertion is raised.
+
 
 Qubit types
 -----------
+
+The ``Ej/Ec`` constraint and reported ratio refer to Josephson energy divided by
+charging energy, with :math:`E_C=e^2/(2C_\mathrm{eff})`. They use the leading-order
+transmon relation :math:`hf_{01}=\sqrt{8E_JE_C}-E_C`, inverted as
+:math:`E_J/E_C=(hf_{01}/E_C+1)^2/8`. This approximation is intended for the
+transmon regime :math:`E_J/E_C\gg1`, not an exact charge-basis Hamiltonian solution.
+See `Koch et al. (2007) <https://arxiv.org/abs/cond-mat/0703002>`_.
 
 The qubit designer classes all implement an ``optimise`` function:
 

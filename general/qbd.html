@@ -158,10 +158,17 @@
 <span class="n">resonator3</span> <span class="o">=</span> <span class="n">ResonatorLC</span><span class="p">(</span><span class="n">L</span><span class="o">=</span><span class="mf">1e-9</span><span class="p">,</span> <span class="n">C</span><span class="o">=</span><span class="mf">1e-12</span><span class="p">)</span>
 </pre></div>
 </div>
+<p>Because the circuit is a parallel LC, <code class="docutils literal notranslate"><span class="pre">get_res_capacitance()</span></code> returns the stored capacitance <span class="math notranslate nohighlight">\(C\)</span> and <code class="docutils literal notranslate"><span class="pre">get_res_inductance()</span></code> returns the stored inductance <span class="math notranslate nohighlight">\(L\)</span>; <code class="docutils literal notranslate"><span class="pre">get_res_impedance()</span></code> returns the characteristic impedance <span class="math notranslate nohighlight">\(\sqrt{L/C}\)</span>. If all three parameters are supplied they must satisfy <span class="math notranslate nohighlight">\(2\pi f_0 = 1/\sqrt{LC}\)</span> (relative tolerance <span class="math notranslate nohighlight">\(10^{-12}\)</span>), otherwise an assertion is raised.</p>
 </section>
 </section>
 <section id="qubit-types">
 <h2>Qubit types<a class="headerlink" href="#qubit-types" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">Ej/Ec</span></code> constraint and reported ratio refer to Josephson energy divided by
+charging energy, with <span class="math notranslate nohighlight">\(E_C=e^2/(2C_\mathrm{eff})\)</span>. They use the leading-order
+transmon relation <span class="math notranslate nohighlight">\(hf_{01}=\sqrt{8E_JE_C}-E_C\)</span>, inverted as
+<span class="math notranslate nohighlight">\(E_J/E_C=(hf_{01}/E_C+1)^2/8\)</span>. This approximation is intended for the
+transmon regime <span class="math notranslate nohighlight">\(E_J/E_C\gg1\)</span>, not an exact charge-basis Hamiltonian solution.
+See <a class="reference external" href="https://arxiv.org/abs/cond-mat/0703002">Koch et al. (2007)</a>.</p>
 <p>The qubit designer classes all implement an <code class="docutils literal notranslate"><span class="pre">optimise</span></code> function:</p>
 <ul class="simple">
 <li><p>The function takes up a dictionary of parameters pertaining to that qubit type</p></li>
