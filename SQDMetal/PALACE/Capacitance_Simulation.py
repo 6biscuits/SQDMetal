@@ -19,6 +19,7 @@ from SQDMetal.PALACE.Utilities.GMSH_Mesh_Builder import GMSH_Mesh_Builder
 from SQDMetal.PALACE.PVDVTU_Viewer import PVDVTU_Viewer
 
 class PALACE_Capacitance_Simulation(PALACE_Model_Base):
+    _supports_wirebonds = True
 
     #Class Variables
     default_user_options = {
@@ -249,7 +250,9 @@ class PALACE_Capacitance_Simulation(PALACE_Model_Base):
                                                                threshold=self.user_options["threshold"],
                                                                simplify_edge_min_angle_deg=self.user_options["simplify_edge_min_angle_deg"],
                                                                full_3D_params = self._full_3D_params,
-                                                               boundary_distances = self._boundary_distances)
+                                                               boundary_distances = self._boundary_distances,
+                                                               wirebonds = self._resolve_wirebonds())
+            self._wirebond_attrs = gmsh_render_attrs.get('wirebonds', [])
             #
             gmb = GMSH_Mesh_Builder(gmsh_render_attrs['fine_mesh_elems'], self.user_options)
             gmb.build_mesh()
@@ -260,6 +263,7 @@ class PALACE_Capacitance_Simulation(PALACE_Model_Base):
 
                 #create config file
                 self._create_config_file(gmsh_render_attrs = gmsh_render_attrs)
+                self._apply_wirebonds_to_config(gmsh_render_attrs)
 
                 #create batch file
                 # if self.mode == 'HPC':

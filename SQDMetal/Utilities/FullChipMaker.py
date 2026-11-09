@@ -617,10 +617,17 @@ class MultiDieChip:
         solver_order=2,
         solver_tol=1.0e-8,
         kinetic_inductance=None,
+        airbridges=False,
         **kwargs,
     ):
         """
         Setup and run Palace eigenmode simulations on a resonator chip (as per MultiDieChip.make_resonator_chip) Qiskit Metal design object. Automatically handles number of eigenmodes, start frequency, and fine-meshing around transmission line and resonators. Assumes that ports are setup on launchpads.
+
+        Args:
+            airbridges (bool | dict): If True, every air-bridge component in the design (e.g. AirBridgeCPW) is simulated as a
+                3D air-bridge via PALACE_Model_Base.add_airbridges_from_design(). A dict is passed onto
+                PALACE_Model_Base.set_airbridge_defaults() (e.g. dict(height=3e-6, thickness=0.5e-6, cross_section='sheet'))
+                and also enables the air-bridges. The 2D air-bridge layers are never added as planar metals. Defaults to False.
         """
         assert self.design is not None, "Please run make_resonator_chip() first."
         assert (
@@ -695,8 +702,8 @@ class MultiDieChip:
             "fillet_resolution": 12,  # Number of vertices per quarter turn on a filleted path
             "palace_dir": palace_binary,  # "PATH/TO/PALACE/BINARY",
             "num_cpus": num_cpus,  # number of CPUs to use for simulation
-            "mesh_min": fine_mesh_min_max[0]*1e3,  # minimum mesh size in mm
-            "mesh_max": fine_mesh_min_max[1]*1e3  # maximum mesh size in mm
+            "mesh_min": fine_mesh_min_max[0],  # minimum mesh size in m
+            "mesh_max": fine_mesh_min_max[1]  # maximum mesh size in m
         }
         user_defined_options.update(kwargs) # update any other options based on kwargs
         max_option_length = max(len(str(option)) for option in user_defined_options)
@@ -752,9 +759,20 @@ class MultiDieChip:
 
         if kinetic_inductance is not None:
             self.eigen_sim.add_kinetic_inductance(kinetic_inductance)
-        
+
+        if airbridges:
+            if isinstance(airbridges, dict):
+                self.eigen_sim.set_airbridge_defaults(**airbridges)
+            num_bridges = self.eigen_sim.add_airbridges_from_design()
+            assert num_bridges > 0, "airbridges was requested, but the design has no air-bridge components (e.g. AirBridgeCPW)."
+            print(f"\nAdded {num_bridges} 3D air-bridges to the simulation.")
+
         self.eigen_sim.prepare_simulation()
-        print(f"\nGMSH mesh exported at {os.path.abspath(f'{sim_name}.msh')}\n")
+        if airbridges:
+            summary = self.eigen_sim.get_wirebond_summary(print_summary=False)
+            issues = [x for x in summary if len(x['issues']) > 0]
+            print(f"{len(summary)} air-bridges meshed; {len(issues)} with warnings (see eigen_sim.get_wirebond_summary()).")
+        print(f"\nGMSH mesh exported at {os.path.abspath(self.eigen_sim._mesh_path)}\n")
     
     def run_palace_eigenmode_resonator(self):
         self.eigen_sim.run()

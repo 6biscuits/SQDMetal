@@ -10,7 +10,7 @@ from SQDMetal.COMSOL.SimRFsParameter import COMSOL_Simulation_RFsParameters
 from SQDMetal.PALACE.Utilities.GMSH_Geometry_Builder import GMSH_Geometry_Builder
 from SQDMetal.PALACE.Utilities.GMSH_Mesh_Builder import GMSH_Mesh_Builder
 from SQDMetal.PALACE.Utilities.GMSH_Navigator import GMSH_Navigator
-# from SQDMetal.PALACE.Utilities.GMSH_WireBond_Builder import GMSH_WireBond_Builder, WireBondProfiles
+from SQDMetal.PALACE.Utilities.GMSH_WireBond_Builder import GMSH_WireBond_Builder, WireBondProfiles
 
 from SQDMetal.Utilities.GeometryProcessors.GeomQiskitMetal import GeomQiskitMetal
 from SQDMetal.Utilities.GeometryProcessors.GeomGDS import GeomGDS
@@ -76,6 +76,27 @@ class PALACE_Model_Base:
         'taper_dist_min': None,             #None -> width/2
         'taper_dist_max': None,             #None -> 8*width
         'epr_metal_air': True               #Include the bond surfaces in the metal-air EPR interface
+    }
+
+    default_airbridge_options = {
+        'cross_section': 'solid',           #'solid' (finite-thickness film) or 'sheet' (zero-thickness conductor - cheapest to mesh)
+        'width': 8e-6,                      #Width of the deck (the bridge stem across the CPW)
+        'thickness': 1e-6,                  #Film thickness (deck thickness for 'flat'; vertical film thickness otherwise)
+        'height': 3e-6,                     #Clearance from the landing surface (top of the metal) to the underside of the deck apex
+        'profile': 'arch',                  #'arch' (reflowed resist), 'flat' (posts + flat deck), 'trapezoid', 'elliptical', 'parabolic', callable or Nx2 array
+        'profile_params': {},               #'trapezoid': rise_fraction, corner_radius
+        'foot_length': None,                #Length of each foot (landing pad) along the bridge; None -> width
+        'foot_width': None,                 #Width of each foot across the bridge (feet wider than the deck form an I-bar); None -> width
+        'material': 'Al',                   #Material name or MaterialConductor object
+        'boundary': 'auto',                 #'auto' (superconductors->PEC, normal metals->conductivity), 'pec' or 'conductivity'
+        'bond_type': 'auto',                #Expected type, checked against the auto-detected classification
+        'num_path_points': 41,              #Samples of the curved underside profile
+        'fine_mesh': True,                  #Automatically refine the mesh around the bridge surfaces
+        'mesh_min': None,                   #None -> width/2
+        'mesh_max': None,                   #None -> user option mesh_max
+        'taper_dist_min': None,             #None -> width/2
+        'taper_dist_max': None,             #None -> 8*width
+        'epr_metal_air': True               #Include the bridge surfaces in the metal-air EPR interface
     }
 
     def __init__(self, sim_parent_directory, meshing:str, mode:str, options: dict, **kwargs):
@@ -170,6 +191,7 @@ class PALACE_Model_Base:
         self._fine_meshes = []
         self._wirebonds = []
         self._wirebond_defaults = copy.deepcopy(PALACE_Model_Base.default_wirebond_options)
+        self._airbridge_defaults = copy.deepcopy(PALACE_Model_Base.default_airbridge_options)
         self._wirebond_attrs = []
         self._sim_config = ""
         self._input_dir = ""
@@ -425,12 +447,145 @@ class PALACE_Model_Base:
             assert k in PALACE_Model_Base.default_wirebond_options, f"Wire-bond option '{k}' is not recognised."
         if name is None:
             name = f"wb_{len(self._wirebonds)}"
+        self._check_bond_name(name)
+        self._wirebonds.append({'name': name, 'kind': 'wirebond', 'pos_start': np.array(pos_start[:2], dtype=float),
+                                'pos_end': np.array(pos_end[:2], dtype=float), **kwargs})
+
+    def _check_bond_name(self, name):
         reserved = ['air_box', 'dielectric_substrate', 'x_neg', 'x_pos', 'y_neg', 'y_pos', 'z_neg', 'z_pos']
         assert name not in reserved and not any(name.startswith(x) for x in ['metal_', 'gap_', 'rf_port_', 'rf_wport_']), \
-            f"Wire-bond name '{name}' clashes with the names reserved for the other mesh physical groups."
-        assert name not in [x['name'] for x in self._wirebonds], f"A wire-bond named '{name}' already exists."
-        self._wirebonds.append({'name': name, 'pos_start': np.array(pos_start[:2], dtype=float),
+            f"Wire-bond/air-bridge name '{name}' clashes with the names reserved for the other mesh physical groups."
+        assert name not in [x['name'] for x in self._wirebonds], f"A wire-bond/air-bridge named '{name}' already exists."
+
+    def set_airbridge_defaults(self, **kwargs):
+        """
+        Sets the default options used for every 3D air-bridge in this simulation (options given explicitly to
+        :func:`~SQDMetal.PALACE.Model.PALACE_Model_Base.add_airbridge` or via
+        :func:`~SQDMetal.PALACE.Model.PALACE_Model_Base.add_airbridges_from_design` take precedence). All lengths are in metres.
+
+        Parameters
+        ----------
+        kwargs : dict
+            Any of the keys in ``PALACE_Model_Base.default_airbridge_options``:
+
+            *   ``'cross_section'`` (`str`):
+                    'solid' (finite-thickness film; default) or 'sheet' (zero-thickness conductor - much cheaper to mesh).
+            *   ``'width'`` (`float`):
+                    Width of the deck (i.e. the stem of the I-bar crossing the CPW). Defaults to 8e-6.
+            *   ``'thickness'`` (`float`):
+                    Film thickness. Defaults to 1e-6. For curved profiles it is measured vertically.
+            *   ``'height'`` (`float`):
+                    Clearance between the landing surface (top of the planar metal) and the underside of the deck apex.
+                    Defaults to 3e-6.
+            *   ``'profile'`` (`str`, callable or array):
+                    'arch' (default; circular arc as obtained by reflowing the resist), 'flat' (vertical posts filling the
+                    feet up to a flat deck - two-layer resist pedestal), 'trapezoid' (sloped side-walls; profile_params
+                    rise_fraction and corner_radius), 'elliptical' or 'parabolic'. Alternatively supply a callable f(t)
+                    returning the height in metres for t in [0,1] along the inner span, or an Nx2 array of
+                    (span-fraction, height).
+            *   ``'foot_length'``, ``'foot_width'`` (`float`):
+                    Size of each foot (landing pad) along/across the bridge. Defaults to the deck width. Feet wider than the
+                    deck give the I-bar shape.
+            *   ``'material'``, ``'boundary'``:
+                    As with wire-bonds (superconductors -> PEC, normal metals -> finite conductivity).
+            *   ``'fine_mesh'``, ``'mesh_min'``, ``'mesh_max'``, ``'taper_dist_min'``, ``'taper_dist_max'``:
+                    Automatic mesh refinement around the bridge surfaces.
+            *   ``'epr_metal_air'`` (`bool`):
+                    Include the bridge surfaces in the metal-air EPR interface. Defaults to True.
+        """
+        for k in kwargs:
+            assert k in PALACE_Model_Base.default_airbridge_options, f"Air-bridge option '{k}' is not recognised."
+            self._airbridge_defaults[k] = kwargs[k]
+
+    def add_airbridge(self, pos_start, pos_end, name:str=None, **kwargs):
+        """
+        Adds a 3D air-bridge whose feet are centred on the two given points (e.g. either side of a CPW). The landing
+        conductors are detected automatically (as with wire-bonds) and conductors joined by air-bridges are treated as a
+        single conductor. Supported in the RF (eigenmode/driven) and capacitance simulations when meshing with GMSH.
+
+        Note: do not also pass the 2D air-bridge layers (e.g. the I-bar layer of
+        :class:`~SQDMetal.Comps.AirBridges.AirBridgeCPW`) to add_metallic, as they would be flattened onto the chip.
+
+        This function must be run before calling :func:`~SQDMetal.PALACE.Model.PALACE_Model_Base.prepare_simulation`.
+
+        Parameters
+        ----------
+        pos_start, pos_end : list|np.ndarray|tuple
+            (x,y) centres of the two feet in metres. Both must lie on the chip.
+        name : str
+            Optional name used for the physical group. Defaults to 'ab_<index>'.
+        kwargs : dict
+            Any air-bridge option (see :func:`~SQDMetal.PALACE.Model.PALACE_Model_Base.set_airbridge_defaults`).
+        """
+        assert self._supports_wirebonds, f"{type(self).__name__} does not support 3D air-bridges yet."
+        assert self.meshing == 'GMSH', "3D air-bridges are currently only supported when meshing with GMSH."
+        for k in kwargs:
+            assert k in PALACE_Model_Base.default_airbridge_options, f"Air-bridge option '{k}' is not recognised."
+        if name is None:
+            name = f"ab_{sum(1 for x in self._wirebonds if x.get('kind') == 'airbridge')}"
+        self._check_bond_name(name)
+        self._wirebonds.append({'name': name, 'kind': 'airbridge', 'pos_start': np.array(pos_start[:2], dtype=float),
                                 'pos_end': np.array(pos_end[:2], dtype=float), **kwargs})
+
+    def add_airbridges_from_design(self, component_names:list=None, **kwargs):
+        """
+        *Applies Qiskit-Metal designs only*
+
+        Adds 3D air-bridges for every air-bridge component in the design (e.g. :class:`~SQDMetal.Comps.AirBridges.AirBridgeCPW`)
+        - i.e. any component providing a ``get_airbridge_specs()`` method. The deck width and foot sizes are taken from the
+        component's I-bar; the height, thickness, profile etc. come from the simulation defaults or ``kwargs``.
+
+        Parameters
+        ----------
+        component_names : list
+            Optional list of component names to restrict the search. Defaults to None (i.e. all components).
+        kwargs : dict
+            Air-bridge options overriding those given in the components and the simulation defaults.
+
+        Returns
+        -------
+        num_added : int
+            Number of air-bridges added.
+        """
+        self._check_if_QiskitMetalDesign()
+        design = self._geom_processor.design
+        names = component_names if component_names is not None else list(design.components.keys())
+        num_added = 0
+        for cur_name in names:
+            comp = design.components[cur_name]
+            if not hasattr(comp, 'get_airbridge_specs'):
+                assert component_names is None, f"Component '{cur_name}' does not define air-bridges."
+                continue
+            for spec in comp.get_airbridge_specs():
+                spec = {**spec, **kwargs}
+                self.add_airbridge(spec.pop('pos_start'), spec.pop('pos_end'), **spec)
+                num_added += 1
+        return num_added
+
+    def _resolve_airbridge(self, cur_ab):
+        ab = copy.deepcopy(self._airbridge_defaults)
+        ab.update(cur_ab)
+        xs = ab['cross_section']
+        assert xs in ['solid', 'sheet'], f"Air-bridge {ab['name']}: cross_section must be 'solid' or 'sheet'."
+        assert ab['width'] > 0 and ab['height'] > 0, f"Air-bridge {ab['name']}: width and height must be positive."
+        if xs == 'solid':
+            assert ab['thickness'] > 0, f"Air-bridge {ab['name']}: thickness must be positive (use cross_section='sheet' for zero thickness)."
+        prof = GMSH_WireBond_Builder.airbridge_profile_name(ab['profile'])
+        assert prof in GMSH_WireBond_Builder.AIRBRIDGE_PROFILES + ['custom'], \
+            f"Air-bridge {ab['name']}: profile '{ab['profile']}' is unsupported. Use one of {GMSH_WireBond_Builder.AIRBRIDGE_PROFILES}, a callable or an array."
+        w = ab['width']
+        for k in ['foot_length', 'foot_width']:
+            if ab[k] is None:
+                ab[k] = w
+        assert ab['foot_length'] > 0 and ab['foot_width'] > 0, f"Air-bridge {ab['name']}: foot_length and foot_width must be positive."
+        for k, v in [('mesh_min', w/2), ('mesh_max', self.user_options['mesh_max']), ('taper_dist_min', w/2), ('taper_dist_max', 8*w)]:
+            if ab[k] is None:
+                ab[k] = v
+        #Fields shared with the wire-bond pipeline (not applicable to air-bridges)
+        ab.update(foot_thickness=0.0, include_feet=True, offchip_termination='open', offchip_z=0.0,
+                  offchip_pad_size=(0.0, 0.0), trihedron='DiscreteTrihedron')
+        ab['boundary'], ab['material_conductor'] = GMSH_WireBond_Builder.resolve_material(ab['material'], ab['boundary'])
+        return ab
 
     def add_wirebonds_from_design(self, component_names:list=None, **kwargs):
         """
@@ -471,6 +626,9 @@ class PALACE_Model_Base:
         #Merges defaults with per-bond options and fills in the automatic values (all lengths in metres)
         resolved = []
         for cur_wb in self._wirebonds:
+            if cur_wb.get('kind') == 'airbridge':
+                resolved.append(self._resolve_airbridge(cur_wb))
+                continue
             wb = copy.deepcopy(self._wirebond_defaults)
             wb.update(cur_wb)
             xs = wb['cross_section']
@@ -521,7 +679,7 @@ class PALACE_Model_Base:
         for meta in self._wirebond_attrs:
             cls = meta['classification']
             summary.append({
-                'name': meta['name'], 'category': meta['category'], 'bond_type': meta['bond_type'],
+                'name': meta['name'], 'kind': meta.get('kind', 'wirebond'), 'category': meta['category'], 'bond_type': meta['bond_type'],
                 'landing': [f['location'] for f in cls['feet']],
                 'landing_metals': [f['metal_index'] for f in cls['feet']],
                 'crosses': cls['crosses'], 'span': cls['span']*1e-3, 'boundary': meta['boundary'],
@@ -530,7 +688,7 @@ class PALACE_Model_Base:
         if print_summary:
             for x in summary:
                 xing = f", crosses metal(s) {x['crosses']}" if len(x['crosses']) > 0 else ""
-                print(f"{x['name']}: {x['bond_type']} [{x['category']}] {x['landing'][0]}({x['landing_metals'][0]}) -> "
+                print(f"{x['name']} ({x['kind']}): {x['bond_type']} [{x['category']}] {x['landing'][0]}({x['landing_metals'][0]}) -> "
                       f"{x['landing'][1]}({x['landing_metals'][1]}), span={x['span']*1e6:.1f}um{xing}, BC={x['boundary']}, "
                       f"conductor={x['conductor_index']}{' (grounded to enclosure)' if x['grounds_to_enclosure'] else ''}")
                 for msg in x['issues']:
