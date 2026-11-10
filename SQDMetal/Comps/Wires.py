@@ -955,3 +955,376 @@ class Wire(QComponent):
         points2 = list(port_line_cords2)
         self.add_pin('pin2', 
                     points2, cpw_width)
+
+
+class WireMeander(QRoute):
+    """Meandered CPW between two pins that solves for an exact (filleted) length and searches for a
+    layout that fits. Similar in use to Qiskit-Metal's RouteMeander, but more robust:
+
+        * Fillets are computed by this component (QUtilities.calc_lines_and_fillets_on_path) and
+          drawn into the geometry, so the renderer never re-fillets it and the qiskit-metal
+          "short segments ... fillet" warning cannot occur. Where corners are too close for the
+          full radius, the radius is reduced locally instead of being left sharp.
+        * total_length is the true length of the drawn (filleted) centre line.
+        * The meander amplitude is solved numerically for the requested length.
+        * If the first layout breaks a rule (fillet radius reduced below fillet_min, the path
+          crossing itself, or overlapping a component in avoid_components), it tries other
+          layouts: mirrored, biased to one side, fewer legs, tighter spacing. The first layout
+          that passes is drawn.
+        * If no layout can reach total_length (pins too far apart, or not enough room under
+          max_amplitude), the build fails with a message giving the reachable length range.
+
+    Inherits QRoute class.
+
+    Layout:
+        A lead of length start_straight leaves the start pin and one of end_straight leaves the end pin
+        (along each pin's normal). Between the two lead tips (S and E), the meander has legs
+        perpendicular to the line S->E, stacked along it every meander.spacing:
+
+                     ______        ______
+                    |      |      |      |                spacing  = centre-to-centre leg distance
+            S ___   |      |      |      |   ___ E        amplitude = solved for total_length
+                 |  |      |      |      |  |
+                 |__|      |______|      |__|
+
+    The CPW is given via:
+        * trace_width, trace_gap - CPW dimensions
+        * fillet            - Requested corner radius (use <= spacing/2 for semicircular U-turns)
+        * fillet_min        - Smallest acceptable radius after local reduction ('' -> 0.99*fillet)
+        * fillet_resolution - Points per fillet arc in the drawn geometry
+
+    Length and leads:
+        * total_length - Length of the filleted centre line from start pin to end pin
+        * lead.start_straight, lead.end_straight - Straight sections off each pin (use >= fillet)
+
+    Meander:
+        * meander.spacing       - Distance between adjacent legs (centre-to-centre). Should be at
+                                  least trace_width + 2*trace_gap (+ some ground in between).
+        * meander.asymmetry     - Offset of the meander centre line from the line S->E
+        * meander.max_amplitude - Maximum leg half-height ('' -> unlimited)
+        * meander.search        - If True, also tries mirrored/one-sided layouts, fewer legs and
+                                  tighter spacing (x0.75, x0.5; never below trace_width +
+                                  2*trace_gap + clearance or 2*fillet_min)
+
+    Snapping:
+        * snap - If True (default), the meander runs along whichever of x or y has the longest
+                 S->E projection (most room for legs) and a straight jog joins it to E, keeping
+                 the route Manhattan. If False, it runs straight along S->E.
+
+    Obstacles:
+        * avoid_components - List of component names to keep clear of, or 'all' (every other
+                             component). The two straight leads are not checked, so the
+                             components at either end can be listed too (this stops the
+                             meander folding back over them); make the leads long enough
+                             to clear them.
+        * clearance        - Minimum ground between this CPW's gap and any avoided geometry
+
+    After building, the chosen layout is stored in self.route_info (legs, amplitude, bias, mirror,
+    length, smallest fillet radius, issues, layouts tried).
+
+    Pins:
+        'start' and 'end' (as with all QRoutes).
+
+    Default Options:
+        * trace_width='10um', trace_gap='10um'
+        * fillet='30um', fillet_min='', fillet_resolution=16
+        * total_length='5mm'
+        * lead=Dict(start_straight='100um', end_straight='50um')
+        * meander=Dict(spacing='200um', asymmetry='0um', max_amplitude='', search=True)
+        * avoid_components=[], clearance='10um'
+        * snap=True
+    """
+
+    default_options = Dict(trace_width='10um',
+                           trace_gap='10um',
+                           fillet='30um',
+                           fillet_min='',
+                           fillet_resolution=16,
+                           total_length='5mm',
+                           lead=Dict(start_straight='100um', end_straight='50um'),
+                           meander=Dict(spacing='200um', asymmetry='0um', max_amplitude='', search=True),
+                           avoid_components=[],
+                           clearance='10um',
+                           snap=True)
+
+    # Layouts to try, in order: (bias, mirror). bias shifts legs to one side of the S->E line
+    # (0 = centred, +-0.8 = mostly on one side); mirror flips which side the first leg goes to.
+    _SEARCH_LAYOUTS = [(0.0, 1), (0.0, -1), (0.5, 1), (0.5, -1), (-0.5, 1), (-0.5, -1),
+                       (0.8, 1), (0.8, -1), (-0.8, 1), (-0.8, -1)]
+
+    @staticmethod
+    def _optional_length(val):
+        """Parsed optional length -> positive float, or None when unset. Anything that is not a
+        positive number counts as unset: '', None, or an empty Dict (which is what a qiskit Dict
+        returns for a missing key)."""
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
+
+    @staticmethod
+    def _snap_axis(delta, start_dir):
+        """x/y unit vector to meander along: the axis with the largest positive projection of
+        delta (most room for legs). Near-ties (within 5%) go to the start lead's direction."""
+        axes = [np.array(a, dtype=float) for a in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+        proj = [float(np.dot(delta, a)) for a in axes]
+        for a, pr in zip(axes, proj):
+            if np.dot(a, start_dir) > 1 - 1e-9 and pr >= 0.95 * max(proj):
+                return a
+        return axes[int(np.argmax(proj))]
+
+    def make(self):
+        p = self.p
+        start = self.set_pin("start")
+        end = self.set_pin("end")
+        precision = self.design.template_options.PRECISION
+
+        r = p.fillet
+        r_min = self._optional_length(p.fillet_min)
+        if r_min is None:
+            r_min = 0.99 * r
+        max_amp = self._optional_length(p.meander.max_amplitude)
+        target = p.total_length
+
+        # Lead tips S, E and meander frame: u is the meander axis, v is perpendicular to it.
+        # With snap, u is the x/y axis with the longest S->E projection. In this frame S=(0, 0)
+        # and E=(D, h): the meander's last leg ends at height h, so no extra jog is needed.
+        S = start.position + start.direction * p.lead.start_straight
+        E = end.position + end.direction * p.lead.end_straight
+        delta = E - S
+        if np.linalg.norm(delta) < 10 ** (-precision):
+            raise ValueError(f"{self.name}: the start and end lead tips coincide; change lead lengths.")
+        if str(p.snap).lower() in ('true', '1'):
+            u = self._snap_axis(delta, start.direction)
+        else:
+            u = delta / np.linalg.norm(delta)
+        v = np.array([-u[1], u[0]])
+        D = float(np.dot(delta, u))
+        h = float(np.dot(delta, v))
+        if abs(h) < 10 ** (-precision):
+            h = 0.0
+
+        # Leg margins at each end of the axis: room for 1 fillet, or 2 if there is a corner there too
+        corner_S = np.dot(start.direction, u) < 1 - 1e-9
+        corner_E = np.dot(-end.direction, u) < 1 - 1e-9
+        margin_min = r * (1 + max(corner_S, corner_E))
+
+        # A U-turn between legs can be at most a semicircle of radius spacing/2. If the requested
+        # fillet is bigger, accept that reduction once here rather than failing every layout on it.
+        base_spacing = p.meander.spacing
+        if r_min > base_spacing / 2:
+            self.logger.warning(f"{self.name}: fillet ({r:.4g}) > spacing/2 ({base_spacing / 2:.4g}); "
+                                f"U-turns will use radius spacing/2. Reduce fillet or increase spacing.")
+            r_min = 0.99 * base_spacing / 2
+
+        # Spacings to try: the requested one, then tighter ones (search only) that still leave
+        # ground between adjacent legs and room for full-radius U-turns
+        min_spacing = max(p.trace_width + 2 * p.trace_gap + p.clearance, 2 * r_min)
+        spacings = [base_spacing]
+        if p.meander.search:
+            spacings += [base_spacing * s for s in (0.75, 0.5) if base_spacing * s >= min_spacing]
+
+        obstacles = self._get_obstacles(p)
+        layouts = self._SEARCH_LAYOUTS if p.meander.search else self._SEARCH_LAYOUTS[:1]
+
+        def assemble(local):
+            local = np.asarray(local, dtype=float)
+            world = S + np.outer(local[:, 0], u) + np.outer(local[:, 1], v)
+            return np.vstack([start.position, world, end.position])
+
+        def build(n_legs, amp, bias, mirror, spacing):
+            # Built mirrored, then flipped back, so the end height h is the same in both cases
+            local = self._meander_local_pts(D, n_legs, spacing, amp, bias, p.meander.asymmetry,
+                                            mirror * h)
+            local[:, 1] *= mirror
+            return assemble(local)
+
+        def length_of(pts):
+            segs = QUtilities.calc_lines_and_fillets_on_path(pts, r, precision)
+            return sum(s['dist'] for s in segs), segs
+
+        tried, best, solved_any = 0, None, False
+        straight_pts = assemble([(0.0, 0.0), (D, 0.0)] + ([(D, h)] if h else []))
+        straight_len, _ = length_of(straight_pts)
+        reach = [straight_len, straight_len]    # [shortest, longest] lengths seen, for errors
+
+        for spacing in spacings:
+            n_max = int(np.floor((D - 2 * margin_min) / spacing)) + 1 if D > 2 * margin_min else 0
+            if n_max < 2 and spacing == base_spacing and D - 2 * margin_min >= 2 * r:
+                spacing = D - 2 * margin_min    # squeeze in a single U-turn
+                n_max = 2
+            for bias, mirror in layouts:
+                for n_legs in range(n_max, 1, -1):
+                    amp_lo = r
+                    amp_hi = max_amp if max_amp is not None else max(target, r)
+                    len_lo = length_of(build(n_legs, amp_lo, bias, mirror, spacing))[0]
+                    len_hi = length_of(build(n_legs, amp_hi, bias, mirror, spacing))[0]
+                    reach = [min(reach[0], len_lo), max(reach[1], len_hi)]
+                    if len_lo > target:
+                        continue    # too long even at minimum amplitude: use fewer legs
+                    if len_hi < target:
+                        break       # too short even at max amplitude: fewer legs only gets shorter
+                    amp = self._solve_amplitude(
+                        lambda a: length_of(build(n_legs, a, bias, mirror, spacing))[0],
+                        target, amp_lo, amp_hi, len_lo, len_hi)
+                    pts = build(n_legs, amp, bias, mirror, spacing)
+                    length, segs = length_of(pts)
+                    issues = self._check_layout(p, pts, segs, r, r_min, spacing, obstacles, precision)
+                    tried += 1
+                    solved_any = True
+                    info = Dict(n_legs=n_legs, amplitude=amp, bias=bias, mirror=mirror,
+                                spacing=spacing, length=length, issues=issues, segs=segs, pts=pts)
+                    if best is None or len(issues) < len(best.issues):
+                        best = info
+                    if not issues:
+                        break
+                if best is not None and not best.issues:
+                    break
+            if best is not None and not best.issues:
+                break
+
+        # A straight connection is fine if it already has the right length
+        if (best is None or best.issues) and abs(straight_len - target) < 1e-6:
+            pts = straight_pts
+            length, segs = length_of(pts)
+            best = Dict(n_legs=0, amplitude=0.0, bias=0.0, mirror=1, spacing=base_spacing,
+                        length=length,
+                        issues=self._check_layout(p, pts, segs, r, r_min, base_spacing, obstacles,
+                                                  precision),
+                        segs=segs, pts=pts)
+            solved_any = True
+
+        if not solved_any:
+            units = self.design.get_units()
+            raise ValueError(
+                f"{self.name}: total_length={target:.4f}{units} cannot be reached. Reachable lengths "
+                f"with these leads/spacing{'/max_amplitude' if max_amp is not None else ''} are "
+                f"{reach[0]:.4f}-{reach[1]:.4f}{units} (lead tips are {np.linalg.norm(delta):.4f}{units} apart). "
+                f"Move the pins, shorten the leads, or change spacing/max_amplitude.")
+
+        if best.issues:
+            self.logger.warning(f"{self.name}: no meander layout passed all checks after {tried} "
+                                f"attempt(s); drawing the best one. Issues: {'; '.join(best.issues)}")
+
+        # Draw the filleted centre line (no renderer filleting: fillet=0 in the geometry tables)
+        fpts = QUtilities.calc_filleted_path(best.pts, r, precision, resolution=p.fillet_resolution)
+        keep = np.r_[True, np.linalg.norm(np.diff(fpts, axis=0), axis=1) > 10 ** (-precision)]
+        line = shapely.LineString(fpts[keep])
+        self.add_qgeometry('path', {'trace': line}, width=p.trace_width, fillet=0, layer=p.layer)
+        self.add_qgeometry('path', {'cut': line}, width=p.trace_width + 2 * p.trace_gap, fillet=0,
+                           layer=p.layer, subtract=True)
+
+        radii = [s['radius'] for s in best.segs if 'radius' in s]
+        self._filleted_length = best.length
+        self.options._actual_length = f"{best.length} {self.design.get_units()}"
+        self.intermediate_pts = best.pts[2:-2]      # keeps QRoute.get_points() meaningful
+        self.route_info = Dict(n_legs=best.n_legs, amplitude=best.amplitude, bias=best.bias,
+                               mirror=best.mirror, spacing=best.spacing, length=best.length,
+                               min_fillet=min(radii) if radii else None, issues=best.issues,
+                               layouts_tried=tried)
+
+    @property
+    def length(self) -> float:
+        """True length of the drawn (filleted) centre line."""
+        return getattr(self, '_filleted_length', 0.0)
+
+    @staticmethod
+    def _meander_local_pts(D, n_legs, spacing, amp, bias, asymmetry, end_level=0.0):
+        """Corner points in the (u, v) frame, from S=(0,0) to E=(D,end_level), with n_legs >= 2
+        legs. Legs run between v=top and v=bot; the first leg starts on v=0 and the last leg
+        ends on v=end_level."""
+        top = asymmetry + amp * (1 + bias)
+        bot = asymmetry - amp * (1 - bias)
+        margin = (D - (n_legs - 1) * spacing) / 2
+        xs = margin + spacing * np.arange(n_legs)
+
+        pts = [(0.0, 0.0), (xs[0], 0.0), (xs[0], top)]
+        level = top
+        for k in range(1, n_legs - 1):
+            pts.append((xs[k], level))
+            level = bot if level == top else top
+            pts.append((xs[k], level))
+        pts += [(xs[-1], level), (xs[-1], end_level), (D, end_level)]
+        return np.array(pts, dtype=float)
+
+    @staticmethod
+    def _solve_amplitude(length_fn, target, lo, hi, f_lo, f_hi, tol=1e-10, max_iter=100):
+        """Solves length_fn(amp) == target on [lo, hi] (length grows with amplitude) using the
+        Illinois false-position method. Length is piecewise linear in amplitude, so this usually
+        converges in a few evaluations; the bracket guarantees convergence regardless."""
+        g_lo, g_hi = f_lo - target, f_hi - target
+        side = 0
+        amp = lo
+        for _ in range(max_iter):
+            amp = (lo * g_hi - hi * g_lo) / (g_hi - g_lo) if g_hi != g_lo else 0.5 * (lo + hi)
+            g = length_fn(amp) - target
+            if abs(g) < tol or hi - lo < tol:
+                break
+            if g < 0:
+                lo, g_lo = amp, g
+                if side == -1:
+                    g_hi *= 0.5
+                side = -1
+            else:
+                hi, g_hi = amp, g
+                if side == 1:
+                    g_lo *= 0.5
+                side = 1
+        return amp
+
+    def _get_obstacles(self, p):
+        """Prepared union of the footprints of the components to avoid (or None)."""
+        names = p.avoid_components
+        if isinstance(names, str):
+            if names.strip().lower() != 'all':
+                names = [names]
+            else:
+                names = [n for n in self.design.components.keys() if n != self.name]
+        shapes = []
+        for name in names:
+            if name not in self.design.components:
+                self.logger.warning(f"{self.name}: avoid_components entry '{name}' is not in the design.")
+                continue
+            for kind in ('path', 'poly'):
+                df = self.design.qgeometry.get_component(name, kind)
+                if df is None:
+                    continue
+                for _, row in df.iterrows():
+                    shapes.append(row.geometry.buffer(row.width / 2, cap_style=2) if kind == 'path'
+                                  else row.geometry)
+        if not shapes:
+            return None
+        union = shapely.unary_union(shapes)
+        shapely.prepare(union)
+        return union
+
+    def _check_layout(self, p, pts, segs, r, r_min, spacing, obstacles, precision):
+        """Human-readable list of problems with a candidate layout (empty = OK)."""
+        issues = []
+        radii = [s['radius'] for s in segs if 'radius' in s]
+        if radii and min(radii) < r_min - 10 ** (-precision):
+            issues.append(f"fillet reduced to {min(radii):.4g} (< fillet_min {r_min:.4g})")
+        if spacing < p.trace_width + 2 * p.trace_gap:
+            issues.append(f"spacing {spacing:.4g} < trace_width + 2*trace_gap: adjacent gaps merge")
+
+        fpts = QUtilities.calc_filleted_path(pts, r, precision, resolution=4)
+        centre = shapely.LineString(fpts)
+        if not centre.is_simple:
+            issues.append("path crosses itself")
+        if obstacles is not None:
+            # Skip the straight leads (minus the fillet that starts on them): they must touch the
+            # components at each end, which can therefore be avoided like everything else. At
+            # least the footprint half-width is always skipped, so the contact at each pin never
+            # counts even when a lead is shorter than the fillet.
+            half = p.trace_width / 2 + p.trace_gap + p.clearance
+            s0 = max(p.lead.start_straight - r, half)
+            s1 = centre.length - max(p.lead.end_straight - r, half)
+            if s1 > s0:
+                from shapely.ops import substring
+                core = substring(centre, s0, s1)
+                # (1nm less, so that merely touching an avoided shape does not count)
+                footprint = core.buffer(half - 1e-6, cap_style=2)
+                if obstacles.intersects(footprint):
+                    issues.append("too close to an avoided component")
+        return issues

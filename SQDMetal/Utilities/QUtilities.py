@@ -6,6 +6,7 @@ import shapely
 import numpy as np
 import itertools
 import geopandas as gpd
+import warnings
 from qiskit_metal import Dict
 from qiskit_metal.toolbox_python.utility_functions import bad_fillet_idxs
 from qiskit_metal.qlibrary.terminations.launchpad_wb import LaunchpadWirebond
@@ -316,146 +317,319 @@ class QUtilities:
             final_pts += [new_pt]
         return np.array(final_pts), np.array(normals), width, gap, total_dist
 
+
     @staticmethod
-    def calc_lines_and_fillets_on_path(points, rFillet, precision):
+    def calc_lines_and_fillets_on_path(points, rFillet, precision, rMin=None):
         """
         Returns the line segments and curved fillets on a given path of points.
 
+        Unlike the original (Qiskit-Metal style) version, corners that are too
+        close together are NOT left sharp. Instead the fillet radius is reduced
+        locally so that neighbouring fillets never overlap. Where there is room,
+        the requested radius rFillet is used unchanged.
+
         Args:
             points: Numpy array of points given as (x,y) on every row.
-            rFillet: Radius of fillets on every corner.
-            precision: The numeric precision in which to calculate bad fillets taken 
-                usually as design.template_options.PRECISION.
+            rFillet: Requested radius of fillets on every corner.
+            precision: Number of decimal places treated as significant
+                (usually design.template_options.PRECISION). Used as a tolerance.
+            rMin: Optional. If given, a warning is raised for any corner whose
+                radius had to be reduced below this value.
 
         Returns:
-            The function returns list of segments each represented as dictionaries. 
+            List of segment dictionaries, with the same keys as before.
 
-            Straight segments have the keys:
-                * 'start' - Starting point of line segment
-                * 'end'   - Ending point of line segment
-                * 'dir'   - Unit-vector of the direction of the line segment
-                * 'dist'  - Length of the line segment
+            Straight segments: 'start', 'end', 'dir', 'dist'
 
-            Curved segments (i.e. ones with fillets) have the keys:
-                * 'start'  - Starting point of line segment
-                * 'end'    - Ending point of line segment
-                * 'centre' - Centre of the circle drawing the fillet arc
-                * 'angleStart' - Starting angle (on Cartesian plane) of the fillet arc 
-                    (in radians) on the corner (not from the centre)
-                * 'angleDelta' - Angle traversed by the fillet arc (in radians) 
-                    using the typical polar angle direction convention in R2
-                * 'dist'   - Arclength of the fillet
+            Curved segments: 'start', 'end', 'centre', 'angleStart',
+                'angleDelta', 'dist', plus a new key:
+                * 'radius' - The actual radius used for this fillet
+                  (<= rFillet).
 
+            Note: 'angleDelta' keeps the original convention, i.e. it is the
+            signed INTERIOR angle at the corner (+ for left turns, - for right
+            turns). The swept arc angle is sign(angleDelta)*(pi - |angleDelta|).
         """
-        # Get list of vertices that can't be filleted
-        no_fillet = bad_fillet_idxs(points, rFillet, precision)
+        tol = 10.0 ** (-precision)
+        points = np.asarray(points, dtype=float)
+
+        # Remove consecutive duplicate points (zero-length segments break directions)
+        if len(points) > 1:
+            steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+            points = points[np.r_[True, steps > tol]]
+        n = len(points)
+        if n < 2:
+            return []
+
+        seg_vec = np.diff(points, axis=0)
+        seg_len = np.linalg.norm(seg_vec, axis=1)
+        seg_dir = seg_vec / seg_len[:, None]
+
+        # Interior angle theta at each internal vertex i = 1..n-2 (stored at index i)
+        theta = np.full(n, np.pi)
+        k = np.zeros(n)  # tangent length per unit radius: 1/tan(theta/2)
+        for i in range(1, n - 1):
+            c = np.clip(np.dot(-seg_dir[i - 1], seg_dir[i]), -1.0, 1.0)
+            theta[i] = np.arccos(c)
+            # No fillet for straight-through (theta ~ pi) or full reversal (theta ~ 0)
+            if np.pi - theta[i] > 1e-9 and theta[i] > 1e-9:
+                k[i] = 1.0 / np.tan(theta[i] / 2)
+
+        # Tangent length each corner wants at the full requested radius
+        t_req = rFillet * k
+
+        # Cap each corner's tangent length at its proportional share of each
+        # adjacent segment. Since both ends of a segment are capped at
+        # complementary shares, t_i + t_{i+1} <= L always holds afterwards.
+        t = t_req.copy()
+        for i in range(1, n - 1):
+            if k[i] == 0:
+                continue
+            for s, other in ((i - 1, i - 1), (i, i + 1)):
+                total = t_req[i] + t_req[other]
+                if total > seg_len[s]:
+                    t[i] = min(t[i], seg_len[s] * t_req[i] / total)
+
+        radii = np.zeros(n)
+        mask = k > 0
+        radii[mask] = t[mask] / k[mask]
+
+        if rMin is not None:
+            small = [i for i in range(1, n - 1) if mask[i] and radii[i] < rMin]
+            if small:
+                warnings.warn(f"Fillet radius reduced below rMin={rMin} at vertex indices {small} (radii: {[float(radii[i]) for i in small]}). Consider spacing these corners further apart.")
 
         line_segs = []
         curPt = points[0]
-        for m, (corner, end) in enumerate(zip(points[1:], points[2:])):
-            a = corner - curPt
-            b = end - corner
-            aDist = np.linalg.norm(a)
-            bDist = np.linalg.norm(b)
-            aHat = a / aDist
-            bHat = b / bDist
-            theta = np.arccos(np.dot(-aHat, bHat))
-            if m + 1 in no_fillet or np.abs(theta - np.pi) < 1e-9:
-                line_segs += [
-                    {
-                        "start": curPt,
-                        "end": corner,
-                        "dir": aHat,
-                        "dist": np.linalg.norm(corner - curPt),
-                    }
-                ]
+        for i in range(1, n - 1):
+            corner = points[i]
+            aHat, bHat = seg_dir[i - 1], seg_dir[i]
+            r = radii[i]
+
+            if r <= 0:
+                # Straight-through or reversal: no fillet
+                line_segs.append({
+                    "start": curPt,
+                    "end": corner,
+                    "dir": aHat,
+                    "dist": np.linalg.norm(corner - curPt),
+                })
                 curPt = corner
+                continue
+
+            ptFilletStart = corner - aHat * t[i]
+            ptFilletEnd = corner + bHat * t[i]
+
+            vCentre = bHat - np.dot(aHat, bHat) * aHat
+            vCentre *= r / np.linalg.norm(vCentre)
+            ptCentre = ptFilletStart + vCentre
+
+            v = ptFilletStart - ptCentre
+            angleStart = np.arctan2(v[1], v[0])
+            if aHat[0] * bHat[1] > aHat[1] * bHat[0]:
+                angleDelta = theta[i]
             else:
-                distTangentEdge = rFillet / np.tan(theta / 2)
-                ptFilletStart = corner - aHat * distTangentEdge
-                ptFilletEnd = corner + bHat * distTangentEdge
+                angleDelta = -theta[i]
 
-                vCentre = bHat - np.dot(aHat, bHat) * aHat
-                vCentre *= rFillet / np.linalg.norm(vCentre)
-                ptCentre = ptFilletStart + vCentre
-
-                angleStart = ptFilletStart - ptCentre
-                angleStart = np.arctan2(angleStart[1], angleStart[0])
-                #
-                if aHat[0] * bHat[1] > aHat[1] * bHat[0]:
-                    angleDelta = theta
-                else:
-                    angleDelta = -theta
-
-                line_segs += [
-                    {
-                        "start": curPt,
-                        "end": ptFilletStart,
-                        "dir": aHat,
-                        "dist": np.linalg.norm(ptFilletStart - curPt),
-                    }
-                ]
-                line_segs += [
-                    {
-                        "start": ptFilletStart,
-                        "end": ptFilletEnd,
-                        "centre": ptCentre,
-                        "angleStart": angleStart,
-                        "angleDelta": angleDelta,
-                        "dist": (np.pi - theta) * rFillet,
-                    }
-                ]
-                curPt = ptFilletEnd
-        distLast = np.linalg.norm(points[-1] - curPt)
-        line_segs += [
-            {
+            # May be (numerically) zero-length when fillets touch; kept so the
+            # line/arc alternation of the output is unchanged.
+            line_segs.append({
                 "start": curPt,
-                "end": points[-1],
-                "dir": (points[-1] - curPt) / distLast,
-                "dist": distLast,
-            }
-        ]
+                "end": ptFilletStart,
+                "dir": aHat,
+                "dist": np.linalg.norm(ptFilletStart - curPt),
+            })
+            line_segs.append({
+                "start": ptFilletStart,
+                "end": ptFilletEnd,
+                "centre": ptCentre,
+                "angleStart": angleStart,
+                "angleDelta": angleDelta,
+                "radius": r,
+                "dist": (np.pi - theta[i]) * r,
+            })
+            curPt = ptFilletEnd
 
+        line_segs.append({
+            "start": curPt,
+            "end": points[-1],
+            "dir": seg_dir[-1],  # avoids divide-by-zero if the fillet ends at the endpoint
+            "dist": np.linalg.norm(points[-1] - curPt),
+        })
         return line_segs
 
     @staticmethod
-    def calc_filleted_path(points, rFillet, precision, resolution=4):
+    def calc_filleted_path(points, rFillet, precision, resolution=4, rMin=None):
         """
-        Returns the coordinates of a given path after filleting (like in Qiskit-Metal).
+        Returns the coordinates of a given path after filleting.
 
         Args:
             points: Numpy array of points given as (x,y) on every row.
-            rFillet: Radius of fillets on every corner.
-            precision: The numeric precision in which to calculate bad fillets 
-                taken usually as design.template_options.PRECISION
+            rFillet: Requested radius of fillets on every corner.
+            precision: Numeric precision (usually design.template_options.PRECISION).
+            resolution: Number of points sampled on each fillet arc.
+            rMin: Optional minimum radius; warns if any corner falls below it.
 
         Returns:
-            List of points (x,y) for the points defining the filleted path.
-
+            Numpy array of points (x,y) defining the filleted path.
         """
-        line_segs = QUtilities.calc_lines_and_fillets_on_path(
-            points, rFillet, precision
-        )
-        # print(line_segs)
+        line_segs = QUtilities.calc_lines_and_fillets_on_path(points, rFillet, precision, rMin=rMin)
         final_pts = []
         for cur_seg in line_segs:
             if "centre" in cur_seg:
                 cx, cy = cur_seg["centre"]
+                r = cur_seg.get("radius", rFillet)  # per-corner radius
                 if cur_seg["angleDelta"] > 0:
                     phi = np.pi - cur_seg["angleDelta"]
                 else:
                     phi = -(np.pi + cur_seg["angleDelta"])
-                curv_pts = [
-                    (rFillet * np.cos(angle) + cx, rFillet * np.sin(angle) + cy)
-                    for angle in np.linspace(
-                        cur_seg["angleStart"], cur_seg["angleStart"] + phi, resolution
-                    )
-                ]
-                final_pts += curv_pts
+                final_pts += [(r * np.cos(a) + cx, r * np.sin(a) + cy) for a in np.linspace(cur_seg["angleStart"], cur_seg["angleStart"] + phi, resolution)]
             else:
                 final_pts.append(cur_seg["start"])
                 final_pts.append(cur_seg["end"])
         return np.array(final_pts)
+
+
+    # @staticmethod
+    # def calc_lines_and_fillets_on_path(points, rFillet, precision):
+    #     """
+    #     Returns the line segments and curved fillets on a given path of points.
+
+    #     Args:
+    #         points: Numpy array of points given as (x,y) on every row.
+    #         rFillet: Radius of fillets on every corner.
+    #         precision: The numeric precision in which to calculate bad fillets taken 
+    #             usually as design.template_options.PRECISION.
+
+    #     Returns:
+    #         The function returns list of segments each represented as dictionaries. 
+
+    #         Straight segments have the keys:
+    #             * 'start' - Starting point of line segment
+    #             * 'end'   - Ending point of line segment
+    #             * 'dir'   - Unit-vector of the direction of the line segment
+    #             * 'dist'  - Length of the line segment
+
+    #         Curved segments (i.e. ones with fillets) have the keys:
+    #             * 'start'  - Starting point of line segment
+    #             * 'end'    - Ending point of line segment
+    #             * 'centre' - Centre of the circle drawing the fillet arc
+    #             * 'angleStart' - Starting angle (on Cartesian plane) of the fillet arc 
+    #                 (in radians) on the corner (not from the centre)
+    #             * 'angleDelta' - Angle traversed by the fillet arc (in radians) 
+    #                 using the typical polar angle direction convention in R2
+    #             * 'dist'   - Arclength of the fillet
+
+    #     """
+    #     # Get list of vertices that can't be filleted
+    #     no_fillet = bad_fillet_idxs(points, rFillet, precision)
+
+    #     line_segs = []
+    #     curPt = points[0]
+    #     for m, (corner, end) in enumerate(zip(points[1:], points[2:])):
+    #         a = corner - curPt
+    #         b = end - corner
+    #         aDist = np.linalg.norm(a)
+    #         bDist = np.linalg.norm(b)
+    #         aHat = a / aDist
+    #         bHat = b / bDist
+    #         theta = np.arccos(np.dot(-aHat, bHat))
+    #         if m + 1 in no_fillet or np.abs(theta - np.pi) < 1e-9:
+    #             line_segs += [
+    #                 {
+    #                     "start": curPt,
+    #                     "end": corner,
+    #                     "dir": aHat,
+    #                     "dist": np.linalg.norm(corner - curPt),
+    #                 }
+    #             ]
+    #             curPt = corner
+    #         else:
+    #             distTangentEdge = rFillet / np.tan(theta / 2)
+    #             ptFilletStart = corner - aHat * distTangentEdge
+    #             ptFilletEnd = corner + bHat * distTangentEdge
+
+    #             vCentre = bHat - np.dot(aHat, bHat) * aHat
+    #             vCentre *= rFillet / np.linalg.norm(vCentre)
+    #             ptCentre = ptFilletStart + vCentre
+
+    #             angleStart = ptFilletStart - ptCentre
+    #             angleStart = np.arctan2(angleStart[1], angleStart[0])
+    #             #
+    #             if aHat[0] * bHat[1] > aHat[1] * bHat[0]:
+    #                 angleDelta = theta
+    #             else:
+    #                 angleDelta = -theta
+
+    #             line_segs += [
+    #                 {
+    #                     "start": curPt,
+    #                     "end": ptFilletStart,
+    #                     "dir": aHat,
+    #                     "dist": np.linalg.norm(ptFilletStart - curPt),
+    #                 }
+    #             ]
+    #             line_segs += [
+    #                 {
+    #                     "start": ptFilletStart,
+    #                     "end": ptFilletEnd,
+    #                     "centre": ptCentre,
+    #                     "angleStart": angleStart,
+    #                     "angleDelta": angleDelta,
+    #                     "dist": (np.pi - theta) * rFillet,
+    #                 }
+    #             ]
+    #             curPt = ptFilletEnd
+    #     distLast = np.linalg.norm(points[-1] - curPt)
+    #     line_segs += [
+    #         {
+    #             "start": curPt,
+    #             "end": points[-1],
+    #             "dir": (points[-1] - curPt) / distLast,
+    #             "dist": distLast,
+    #         }
+    #     ]
+
+    #     return line_segs
+
+    # @staticmethod
+    # def calc_filleted_path(points, rFillet, precision, resolution=4):
+    #     """
+    #     Returns the coordinates of a given path after filleting (like in Qiskit-Metal).
+
+    #     Args:
+    #         points: Numpy array of points given as (x,y) on every row.
+    #         rFillet: Radius of fillets on every corner.
+    #         precision: The numeric precision in which to calculate bad fillets 
+    #             taken usually as design.template_options.PRECISION
+
+    #     Returns:
+    #         List of points (x,y) for the points defining the filleted path.
+
+    #     """
+    #     line_segs = QUtilities.calc_lines_and_fillets_on_path(
+    #         points, rFillet, precision
+    #     )
+    #     # print(line_segs)
+    #     final_pts = []
+    #     for cur_seg in line_segs:
+    #         if "centre" in cur_seg:
+    #             cx, cy = cur_seg["centre"]
+    #             if cur_seg["angleDelta"] > 0:
+    #                 phi = np.pi - cur_seg["angleDelta"]
+    #             else:
+    #                 phi = -(np.pi + cur_seg["angleDelta"])
+    #             curv_pts = [
+    #                 (rFillet * np.cos(angle) + cx, rFillet * np.sin(angle) + cy)
+    #                 for angle in np.linspace(
+    #                     cur_seg["angleStart"], cur_seg["angleStart"] + phi, resolution
+    #                 )
+    #             ]
+    #             final_pts += curv_pts
+    #         else:
+    #             final_pts.append(cur_seg["start"])
+    #             final_pts.append(cur_seg["end"])
+    #     return np.array(final_pts)
 
     @staticmethod
     def get_metals_in_layer(design, layer_id, **kwargs):
