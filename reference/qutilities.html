@@ -161,19 +161,20 @@ Sorted, ascending up each column from bottom left to top right.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="SQDMetal.Utilities.QUtilities.QUtilities.calc_filleted_path">
-<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">calc_filleted_path</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rFillet</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">precision</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resolution</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#SQDMetal.Utilities.QUtilities.QUtilities.calc_filleted_path" title="Link to this definition"></a></dt>
-<dd><p>Returns the coordinates of a given path after filleting (like in Qiskit-Metal).</p>
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">calc_filleted_path</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rFillet</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">precision</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resolution</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rMin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#SQDMetal.Utilities.QUtilities.QUtilities.calc_filleted_path" title="Link to this definition"></a></dt>
+<dd><p>Returns the coordinates of a given path after filleting.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>points</strong> – Numpy array of points given as (x,y) on every row.</p></li>
-<li><p><strong>rFillet</strong> – Radius of fillets on every corner.</p></li>
-<li><p><strong>precision</strong> – The numeric precision in which to calculate bad fillets
-taken usually as design.template_options.PRECISION</p></li>
+<li><p><strong>rFillet</strong> – Requested radius of fillets on every corner.</p></li>
+<li><p><strong>precision</strong> – Numeric precision (usually design.template_options.PRECISION).</p></li>
+<li><p><strong>resolution</strong> – Number of points sampled on each fillet arc.</p></li>
+<li><p><strong>rMin</strong> – Optional minimum radius; warns if any corner falls below it.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>List of points (x,y) for the points defining the filleted path.</p>
+<dd class="field-even"><p>Numpy array of points (x,y) defining the filleted path.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -200,45 +201,37 @@ called ‘trace’ in normal wiring/routing objects) is selected.</p></li>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="SQDMetal.Utilities.QUtilities.QUtilities.calc_lines_and_fillets_on_path">
-<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">calc_lines_and_fillets_on_path</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rFillet</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">precision</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#SQDMetal.Utilities.QUtilities.QUtilities.calc_lines_and_fillets_on_path" title="Link to this definition"></a></dt>
+<span class="property"><span class="k"><span class="pre">static</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">calc_lines_and_fillets_on_path</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">points</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rFillet</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">precision</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rMin</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#SQDMetal.Utilities.QUtilities.QUtilities.calc_lines_and_fillets_on_path" title="Link to this definition"></a></dt>
 <dd><p>Returns the line segments and curved fillets on a given path of points.</p>
+<p>Unlike the original (Qiskit-Metal style) version, corners that are too
+close together are NOT left sharp. Instead the fillet radius is reduced
+locally so that neighbouring fillets never overlap. Where there is room,
+the requested radius rFillet is used unchanged.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>points</strong> – Numpy array of points given as (x,y) on every row.</p></li>
-<li><p><strong>rFillet</strong> – Radius of fillets on every corner.</p></li>
-<li><p><strong>precision</strong> – The numeric precision in which to calculate bad fillets taken
-usually as design.template_options.PRECISION.</p></li>
+<li><p><strong>rFillet</strong> – Requested radius of fillets on every corner.</p></li>
+<li><p><strong>precision</strong> – Number of decimal places treated as significant
+(usually design.template_options.PRECISION). Used as a tolerance.</p></li>
+<li><p><strong>rMin</strong> – Optional. If given, a warning is raised for any corner whose
+radius had to be reduced below this value.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p><p>The function returns list of segments each represented as dictionaries.</p>
-<dl class="simple">
-<dt>Straight segments have the keys:</dt><dd><ul class="simple">
-<li><p>’start’ - Starting point of line segment</p></li>
-<li><p>’end’   - Ending point of line segment</p></li>
-<li><p>’dir’   - Unit-vector of the direction of the line segment</p></li>
-<li><p>’dist’  - Length of the line segment</p></li>
-</ul>
-</dd>
-<dt>Curved segments (i.e. ones with fillets) have the keys:</dt><dd><ul class="simple">
-<li><p>’start’  - Starting point of line segment</p></li>
-<li><p>’end’    - Ending point of line segment</p></li>
-<li><p>’centre’ - Centre of the circle drawing the fillet arc</p></li>
-<li><dl class="simple">
-<dt>’angleStart’ - Starting angle (on Cartesian plane) of the fillet arc</dt><dd><p>(in radians) on the corner (not from the centre)</p>
+<dd class="field-even"><p><p>List of segment dictionaries, with the same keys as before.</p>
+<p>Straight segments: ‘start’, ‘end’, ‘dir’, ‘dist’</p>
+<dl>
+<dt>Curved segments: ‘start’, ‘end’, ‘centre’, ‘angleStart’,</dt><dd><p>’angleDelta’, ‘dist’, plus a new key:
+* ‘radius’ - The actual radius used for this fillet</p>
+<blockquote>
+<div><p>(&lt;= rFillet).</p>
+</div></blockquote>
 </dd>
 </dl>
-</li>
-<li><dl class="simple">
-<dt>’angleDelta’ - Angle traversed by the fillet arc (in radians)</dt><dd><p>using the typical polar angle direction convention in R2</p>
-</dd>
-</dl>
-</li>
-<li><p>’dist’   - Arclength of the fillet</p></li>
-</ul>
-</dd>
-</dl>
+<p>Note: ‘angleDelta’ keeps the original convention, i.e. it is the
+signed INTERIOR angle at the corner (+ for left turns, - for right
+turns). The swept arc angle is sign(angleDelta)*(pi - <a href="#id3"><span class="problematic" id="id4">|angleDelta|</span></a>).</p>
 </p>
 </dd>
 </dl>
